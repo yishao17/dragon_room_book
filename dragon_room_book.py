@@ -6,11 +6,17 @@ import sqlite3
 from datetime import datetime, timedelta
 import requests
 import time
+import pytz
 
-secret = "secret_key"
+secret = "secretkey"
 bot = telebot.TeleBot('API_TOKEN', threaded=False)
 bot.remove_webhook()
-bot.set_webhook(url="https://{username}.pythonanywhere.com/{}".format(secret))
+bot.set_webhook(url="https://{pythonanywhere_username}.pythonanywhere.com/{}".format(secret))
+
+ADMIN_USERNAME = "{admin_username}"
+
+def is_admin(user):
+    return user == ADMIN_USERNAME
 
 app = Flask(__name__)
 @app.route('/{}'.format(secret), methods=["POST"])
@@ -59,7 +65,64 @@ def cleanup_expired_bookings():
         """,
         (today_start,)
     )
-    conn.commit()
+
+    while True:
+        cursor.execute(
+            """
+            SELECT id, user_id, username, room, start_date_time, end_date_time, remarks
+            FROM bookings
+            ORDER BY username, room, start_date_time
+            """
+        )
+        bookings = cursor.fetchall()
+
+        previous_booking = None
+        combined = False  # Flag to track if any combination happened
+
+        for booking in bookings:
+            booking_id, user_id, username, room, start_date_time, end_date_time, remarks = booking
+
+            if previous_booking:
+                prev_id, prev_user_id, prev_username, prev_room, prev_start_date_time, prev_end_date_time, prev_remarks = previous_booking
+
+                # Check if the current booking can be combined with the previous one
+                if (
+                    username == prev_username and
+                    room == prev_room and
+                    remarks == prev_remarks and
+                    start_date_time == prev_end_date_time
+                ):
+                    # Update the end time of the previous booking
+                    cursor.execute(
+                        """
+                        UPDATE bookings
+                        SET end_date_time = ?
+                        WHERE id = ?
+                        """,
+                        (end_date_time, prev_id)
+                    )
+
+                    # Delete the current booking as it's now merged with the previous one
+                    cursor.execute(
+                        """
+                        DELETE FROM bookings
+                        WHERE id = ?
+                        """,
+                        (booking_id,)
+                    )
+
+                    combined = True  # Set the flag to true since a combination occurred
+                else:
+                    previous_booking = booking
+            else:
+                previous_booking = booking
+
+        conn.commit()
+
+        # If no combination happened in this iteration, break the loop
+        if not combined:
+            break
+
     conn.close()
 
 def format_time(dt):
@@ -81,15 +144,7 @@ def format_date_time(dt, time_str):
     updated_dt = dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
     return updated_dt
 
-time_list = [
-    '0000', '0030', '0100', '0130', '0200', '0230', '0300', '0330', '0400',
-    '0430', '0500', '0530', '0600', '0630', '0700', '0730', '0800', '0830',
-    '0900', '0930', '1000', '1030', '1100', '1130', '1200', '1230', '1300',
-    '1330', '1400', '1430', '1500', '1530', '1600', '1630', '1700', '1730',
-    '1800', '1830', '1900', '1930', '2000', '2030', '2100', '2130', '2200',
-    '2230', '2300', '2330'
-]
-
+time_list = ['0000','0100', '0200', '0300', '0400', '0500', '0600', '0700', '0800','0900','1000', '1100', '1200', '1300', '1400', '1500', '1600', '1700', '1800','1900','2000','2100','2200','2300']
 
 ### START COMMAND ###
 @bot.message_handler(commands=['start'])
@@ -100,7 +155,8 @@ def welcome(message):
     view_all_command = "/view_all - to view all current bookings\n"
     view_own_command = "/view_own - to view your bookings\n"
     cancel_command = "/cancel - to cancel your bookings\n"
-    help_text = f"{intro_text}{select_command}{view_all_command}{view_own_command}{cancel_command} \nor you can use "
+    now_command  = "/now - to see which rooms are available now\n"
+    help_text = f"{intro_text}{select_command}{view_all_command}{view_own_command}{cancel_command}{now_command} \nor you can use "
     help_command = "/help to view all the commands later!"
     welcome_text = name_text + help_text + help_command
     bot.reply_to(message, text=welcome_text)
@@ -113,7 +169,8 @@ def help(message):
     view_all_command = "/view_all - to view all current bookings\n"
     view_own_command = "/view_own - to view your bookings\n"
     cancel_command = "/cancel - to cancel your bookings\n"
-    help_text = f"{intro_text}{select_command}{view_all_command}{view_own_command}{cancel_command}"
+    now_command  = "/now - to see which rooms are available now\n"
+    help_text = f"{intro_text}{select_command}{view_all_command}{view_own_command}{cancel_command}{now_command}"
     bot.reply_to(message, text=help_text)
 
 def show_room_selection(chat_id, message_id, optional=0):
@@ -228,6 +285,87 @@ def cancel(message):
         bot.reply_to(message, text="You have no bookings to cancel.")
 
     conn.close()
+
+#CANCEL ADMIN
+@bot.message_handler(commands=['cancel_admin'])
+def admin(message):
+    if is_admin(message.from_user.username):
+        conn = sqlite3.connect("room_bookings.db")
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT id, room, start_date_time, end_date_time FROM bookings ORDER BY room, start_date_time")
+        bookings = cursor.fetchall()
+
+        if bookings:
+            keyboard = telebot.types.InlineKeyboardMarkup()
+            for booking in bookings:
+                changed_start = booking[2]
+                changed_end = booking[3]
+                start_dt = datetime.strptime(changed_start, '%Y-%m-%d %H:%M:%S')
+                end_dt = datetime.strptime(changed_end, '%Y-%m-%d %H:%M:%S')
+                start_date = format_day(start_dt)
+                start_time = format_time(start_dt)
+                end_time = format_time(end_dt)
+                keyboard.row(telebot.types.InlineKeyboardButton(f"{booking[1]}: {start_date} {start_time} - {end_time}", callback_data=f"cancel|{booking[0]}"))
+            keyboard.row(telebot.types.InlineKeyboardButton("Cancel", callback_data=f"change_cancel|"))
+            bot.reply_to(message, text='Select a booking to cancel:', reply_markup=keyboard)
+        else:
+            bot.reply_to(message, text="No bookings to cancel.")
+
+        conn.close()
+    else:
+        bot.reply_to(message, text="You are not an admin! Please contact @yishao17!")
+
+### CANCEL_ADMIN COMMAND ###
+@bot.message_handler(commands=['now'])
+def now(message):
+    conn = sqlite3.connect("room_bookings.db")
+    cursor = conn.cursor()
+
+    singapore_tz = pytz.timezone('Asia/Singapore')
+
+    # Get the current time in UTC and convert to Singapore timezone
+    utc_now = datetime.now(pytz.utc)
+    singapore_time = utc_now.astimezone(singapore_tz)
+
+    # Format the datetime object for SQL query
+    current_time_str = singapore_time.strftime('%Y-%m-%d %H:%M:%S')
+
+    # Query to get all rooms that are currently booked
+    cursor.execute(
+        """
+        SELECT DISTINCT room
+        FROM bookings
+        WHERE start_date_time <= ? AND end_date_time > ?
+        """,
+        (current_time_str, current_time_str)
+    )
+    booked_rooms = {row[0] for row in cursor.fetchall()}
+
+    # Assume a predefined list of all possible rooms
+    custom_order = ['L6 Lounge', 'L7 Lounge', 'L8 Lounge', 'L6 Study Rm']  # Specify desired order
+
+    # Find rooms that are not booked
+    available_rooms = [room for room in custom_order if room not in booked_rooms]
+
+    conn.close()
+    keyboard = telebot.types.InlineKeyboardMarkup()
+
+    if available_rooms:
+        available_rooms_str = '\n'.join(f"- {room}" for room in available_rooms)
+        text_to_reply = f"The following rooms are available now:\n\n{available_rooms_str}\n\nPlease book them if you want to use them!"
+        # Add buttons for each available room
+        for room in available_rooms:
+            keyboard.row(
+                telebot.types.InlineKeyboardButton(f'{room}', callback_data=f'selected_rm|{room}'),
+            )
+        keyboard.row(telebot.types.InlineKeyboardButton("Cancel", callback_data=f"change_cancel|"))
+    else:
+        text_to_reply = "Currently, no rooms are available. Please check back later!"
+        keyboard = None
+
+    # Send the message with the inline keyboard
+    bot.reply_to(message, text=text_to_reply, reply_markup=keyboard)
 
 ### CANCEL SELECTION HANDLER ###
 @bot.callback_query_handler(func=lambda call: call.data.startswith('cancel|'))
@@ -438,6 +576,14 @@ def reset_db():
     conn.commit()
     conn.close()
 
+@bot.message_handler(commands=['reset'])
+def reset(message):
+    if is_admin(message.from_user.username):
+        reset_db()
+        bot.reply_to(message, text="reset!")
+    else:
+        bot.reply_to(message, text="You are not an admin! Please contact @yishao17!")
+
 ### ALL OTHER MESSAGES HANDLING ###
 @bot.message_handler(func=lambda message: True)
 def reply_func(message):
@@ -456,14 +602,3 @@ def back(call):
         select_end_time(call)
     elif initial == 'change_cancel':
         bot.delete_message(chat_id=call.message.chat.id, message_id=call.message.message_id)
-
-# # Start polling
-# while True:
-#     try:
-#         bot.polling()
-#     except requests.exceptions.ReadTimeout:
-#         print("ReadTimeout occurred. Retrying...")
-#         time.sleep(10)  # wait for a while before retrying
-#     except requests.exceptions.ConnectionError:
-#         print("ConnectionError occurred. Retrying...")
-#         time.sleep(10)
